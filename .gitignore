@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+.coverage
+.pytest_cache/
+.venv/
+.tmp/*
+!.tmp/.gitkeep
+dist/
+build/
+*.egg-info/
