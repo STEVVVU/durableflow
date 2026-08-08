@@ -4,16 +4,56 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "durableflow"
-version = "0.1.0"
-description = "A durable SQLite-backed job orchestration service"
+version = "0.2.0"
+description = "A durable Postgres/SQLite-backed job orchestration service"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "STEVVVU" }]
-dependencies = []
+dependencies = [
+    # API layer: typed request/response contracts and an ASGI server.
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    # Persistence: typed ORM plus versioned schema migrations.
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    # Observability: structured logs, metrics, traces.
+    "structlog>=24",
+    "prometheus-client>=0.21",
+    "opentelemetry-sdk>=1.29",
+    "opentelemetry-api>=1.29",
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
+]
+
+[project.optional-dependencies]
+# Production backend. SQLite remains the zero-setup local/test default.
+postgres = ["psycopg[binary]>=3.2"]
+dev = [
+    "pytest>=8.3",
+    "httpx>=0.28",
+    "ruff>=0.8",
+    "psycopg[binary]>=3.2",
+]
 
 [project.scripts]
 durableflow = "durableflow.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["durableflow*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "postgres: requires a live PostgreSQL instance (set DURABLEFLOW_TEST_POSTGRES_URL)",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4"]
