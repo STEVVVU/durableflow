@@ -4,12 +4,16 @@ import threading
 import time
 import traceback
 import uuid
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Mapping
+from typing import Any
 
+from durableflow import observability
 from durableflow.models import Job
 from durableflow.store import JobStore
 from durableflow.tasks import DEFAULT_TASKS, TaskCancelled, TaskContext, TaskHandler
+
+LOGGER = observability.get_logger("worker")
 
 
 class Worker:
@@ -72,6 +76,12 @@ class Worker:
         task_name = str(job.payload.get("task", "echo"))
         handler = self.handlers.get(task_name)
         if handler is None:
+            LOGGER.error(
+                "no handler registered for task",
+                job_id=job.id,
+                worker_id=self.worker_id,
+                task=task_name,
+            )
             self.store.fail(
                 job.id,
                 self.worker_id,
@@ -89,18 +99,44 @@ class Worker:
                 job.id, key, value
             ),
         )
-        try:
-            result = handler(job.payload, context)
-            self.store.complete(job.id, self.worker_id, job.lease_token, result)
-        except TaskCancelled:
-            self.store.acknowledge_cancellation(
-                job.id, self.worker_id, job.lease_token
-            )
-        except BaseException as error:
-            rendered = "".join(
-                traceback.format_exception_only(type(error), error)
-            ).strip()
-            self.store.fail(job.id, self.worker_id, job.lease_token, rendered)
+        # One span per attempt, carrying the identifiers needed to correlate a
+        # trace with the durable event history and the worker's logs.
+        tracer = observability.get_tracer("durableflow.worker")
+        with tracer.start_as_current_span("durableflow.execute") as span:
+            span.set_attribute("durableflow.job_id", job.id)
+            span.set_attribute("durableflow.task", task_name)
+            span.set_attribute("durableflow.attempt", job.attempts)
+            span.set_attribute("durableflow.worker_id", self.worker_id)
+            span.set_attribute("durableflow.queue", job.queue)
+            try:
+                result = handler(job.payload, context)
+                self.store.complete(job.id, self.worker_id, job.lease_token, result)
+            except TaskCancelled:
+                LOGGER.info(
+                    "task observed cancellation",
+                    job_id=job.id,
+                    worker_id=self.worker_id,
+                    task=task_name,
+                )
+                span.set_attribute("durableflow.outcome", "cancelled")
+                self.store.acknowledge_cancellation(
+                    job.id, self.worker_id, job.lease_token
+                )
+            except BaseException as error:
+                rendered = "".join(
+                    traceback.format_exception_only(type(error), error)
+                ).strip()
+                LOGGER.warning(
+                    "task raised",
+                    job_id=job.id,
+                    worker_id=self.worker_id,
+                    task=task_name,
+                    attempt=job.attempts,
+                    error=rendered,
+                )
+                span.set_attribute("durableflow.outcome", "failed")
+                span.record_exception(error)
+                self.store.fail(job.id, self.worker_id, job.lease_token, rendered)
 
     def _reap(self) -> None:
         with self._active_lock:

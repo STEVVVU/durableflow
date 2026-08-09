@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import threading
 
+from durableflow import observability
 from durableflow.store import JobStore
+
+LOGGER = observability.get_logger("coordinator")
 
 
 class Coordinator:
@@ -19,8 +22,15 @@ class Coordinator:
         return self.store.recover_expired()
 
     def run_forever(self) -> None:
+        LOGGER.info(
+            "coordinator sweeping",
+            sweep_interval=self.sweep_interval,
+            skip_locked=self.store.uses_skip_locked,
+        )
         while not self._stop.is_set():
-            self.tick()
+            recovered = self.tick()
+            if recovered:
+                LOGGER.info("sweep recovered abandoned work", recovered=recovered)
             self._stop.wait(self.sweep_interval)
 
     def stop(self) -> None:

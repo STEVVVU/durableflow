@@ -1,78 +1,22 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import uuid
-from contextlib import closing, contextmanager
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any
 
+from sqlalchemy import Engine, delete, func, insert, select, update
+from sqlalchemy.engine import Connection
+
+from durableflow import observability
 from durableflow.clock import SystemClock
+from durableflow.engine import create_db_engine, create_schema, is_postgres, normalize_url
 from durableflow.models import Job, JobStatus, Submission
+from durableflow.orm import EffectRecord, JobEventRecord, JobRecord, WorkerRecord
 
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS jobs (
-    id TEXT PRIMARY KEY,
-    queue TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (
-        status IN ('queued', 'running', 'succeeded', 'dead_letter', 'cancelled')
-    ),
-    idempotency_key TEXT,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    max_attempts INTEGER NOT NULL,
-    available_at REAL NOT NULL,
-    lease_owner TEXT,
-    lease_token TEXT,
-    lease_expires_at REAL,
-    heartbeat_at REAL,
-    cancel_requested INTEGER NOT NULL DEFAULT 0,
-    result TEXT,
-    last_error TEXT,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    completed_at REAL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS jobs_idempotency
-ON jobs(queue, idempotency_key) WHERE idempotency_key IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS jobs_claimable
-ON jobs(queue, status, available_at, created_at);
-
-CREATE INDEX IF NOT EXISTS jobs_expired
-ON jobs(status, lease_expires_at);
-
-CREATE TABLE IF NOT EXISTS job_events (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id TEXT NOT NULL REFERENCES jobs(id),
-    event_type TEXT NOT NULL,
-    worker_id TEXT,
-    attempt INTEGER,
-    detail TEXT,
-    occurred_at REAL NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS job_events_job
-ON job_events(job_id, sequence);
-
-CREATE TABLE IF NOT EXISTS workers (
-    worker_id TEXT PRIMARY KEY,
-    queue TEXT NOT NULL,
-    capacity INTEGER NOT NULL,
-    in_flight INTEGER NOT NULL,
-    last_seen_at REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS effects (
-    job_id TEXT NOT NULL REFERENCES jobs(id),
-    effect_key TEXT NOT NULL,
-    value TEXT NOT NULL,
-    recorded_at REAL NOT NULL,
-    PRIMARY KEY (job_id, effect_key)
-);
-"""
+LOGGER = observability.get_logger("store")
 
 
 def _json(value: Any) -> str:
@@ -84,65 +28,72 @@ class JobStore:
 
     def __init__(
         self,
-        database: str | Path,
+        database: str | Path | None = None,
         *,
         clock: Any | None = None,
         base_backoff: float = 1.0,
         max_backoff: float = 60.0,
+        engine: Engine | None = None,
+        create_tables: bool = True,
     ) -> None:
-        self.database = str(database)
+        if engine is None and database is None:
+            raise ValueError("either database or engine must be provided")
         self.clock = clock or SystemClock()
         self.base_backoff = base_backoff
         self.max_backoff = max_backoff
-        Path(self.database).parent.mkdir(parents=True, exist_ok=True)
-        self._anchor: sqlite3.Connection | None = self._connect()
-        self._anchor.execute("PRAGMA journal_mode=WAL")
-        self._anchor.executescript(SCHEMA)
+        if engine is not None:
+            self._engine = engine
+            self._owns_engine = False
+            self.database = str(engine.url)
+        else:
+            self.database = normalize_url(database)  # type: ignore[arg-type]
+            self._engine = create_db_engine(self.database)
+            self._owns_engine = True
+        # PostgreSQL claims with row-level locks and SKIP LOCKED; SQLite claims
+        # under the database-wide write lock taken by BEGIN IMMEDIATE.
+        self._skip_locked = is_postgres(str(self._engine.url))
+        if create_tables:
+            create_schema(self._engine)
+
+    @property
+    def engine(self) -> Engine:
+        return self._engine
+
+    @property
+    def uses_skip_locked(self) -> bool:
+        """True when claims use PostgreSQL ``FOR UPDATE SKIP LOCKED``."""
+        return self._skip_locked
 
     def close(self) -> None:
-        if self._anchor is not None:
-            self._anchor.close()
-            self._anchor = None
+        if self._owns_engine and self._engine is not None:
+            self._engine.dispose()
 
-    def __enter__(self) -> "JobStore":
+    def __enter__(self) -> JobStore:
         return self
 
     def __exit__(self, *args: Any) -> None:
         self.close()
 
-    def __del__(self) -> None:
-        anchor = getattr(self, "_anchor", None)
-        if anchor is not None:
-            anchor.close()
+    @contextmanager
+    def _transaction(self) -> Iterator[Connection]:
+        """Run one write transaction.
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.database,
-            timeout=10,
-            isolation_level=None,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=10000")
-        connection.execute("PRAGMA synchronous=NORMAL")
-        return connection
+        On SQLite the engine's ``begin`` hook emits ``BEGIN IMMEDIATE``, so the
+        write lock is held for the whole block and a claim's read cannot
+        interleave with another claimant's write. On PostgreSQL isolation comes
+        from row locks taken inside the claim query itself.
+        """
+        with self._engine.begin() as connection:
+            yield connection
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
+    def _reader(self) -> Iterator[Connection]:
+        with self._engine.connect() as connection:
             yield connection
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
 
     def _event(
         self,
-        connection: sqlite3.Connection,
+        connection: Connection,
         job_id: str,
         event_type: str,
         *,
@@ -152,20 +103,16 @@ class JobStore:
         now: float,
     ) -> None:
         connection.execute(
-            """
-            INSERT INTO job_events
-                (job_id, event_type, worker_id, attempt, detail, occurred_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                job_id,
-                event_type,
-                worker_id,
-                attempt,
-                _json(detail) if detail is not None else None,
-                now,
-            ),
+            insert(JobEventRecord).values(
+                job_id=job_id,
+                event_type=event_type,
+                worker_id=worker_id,
+                attempt=attempt,
+                detail=_json(detail) if detail is not None else None,
+                occurred_at=now,
+            )
         )
+        observability.record_event_metric(event_type)
 
     def submit(
         self,
@@ -186,30 +133,36 @@ class JobStore:
         with self._transaction() as connection:
             if idempotency_key is not None:
                 existing = connection.execute(
-                    "SELECT * FROM jobs WHERE queue = ? AND idempotency_key = ?",
-                    (queue, idempotency_key),
-                ).fetchone()
+                    select(JobRecord).where(
+                        JobRecord.queue == queue,
+                        JobRecord.idempotency_key == idempotency_key,
+                    )
+                ).mappings().first()
                 if existing:
+                    observability.JOBS_DUPLICATE_SUBMISSIONS.labels(queue=queue).inc()
+                    LOGGER.info(
+                        "duplicate submission short-circuited",
+                        job_id=existing["id"],
+                        queue=queue,
+                        idempotency_key=idempotency_key,
+                    )
                     return Submission(Job.from_row(existing), created=False)
 
             job_id = str(uuid.uuid4())
             connection.execute(
-                """
-                INSERT INTO jobs (
-                    id, queue, payload, status, idempotency_key, attempts,
-                    max_attempts, available_at, created_at, updated_at
-                ) VALUES (?, ?, ?, 'queued', ?, 0, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    queue,
-                    _json(payload),
-                    idempotency_key,
-                    max_attempts,
-                    now + delay_seconds,
-                    now,
-                    now,
-                ),
+                insert(JobRecord).values(
+                    id=job_id,
+                    queue=queue,
+                    payload=_json(payload),
+                    status=JobStatus.QUEUED.value,
+                    idempotency_key=idempotency_key,
+                    attempts=0,
+                    max_attempts=max_attempts,
+                    available_at=now + delay_seconds,
+                    cancel_requested=0,
+                    created_at=now,
+                    updated_at=now,
+                )
             )
             self._event(
                 connection,
@@ -219,15 +172,23 @@ class JobStore:
                 now=now,
             )
             row = connection.execute(
-                "SELECT * FROM jobs WHERE id = ?", (job_id,)
-            ).fetchone()
+                select(JobRecord).where(JobRecord.id == job_id)
+            ).mappings().one()
+            observability.JOBS_SUBMITTED.labels(queue=queue).inc()
+            LOGGER.info(
+                "job submitted",
+                job_id=job_id,
+                queue=queue,
+                max_attempts=max_attempts,
+                delay_seconds=delay_seconds,
+            )
             return Submission(Job.from_row(row), created=True)
 
     def get(self, job_id: str) -> Job | None:
-        with closing(self._connect()) as connection:
+        with self._reader() as connection:
             row = connection.execute(
-                "SELECT * FROM jobs WHERE id = ?", (job_id,)
-            ).fetchone()
+                select(JobRecord).where(JobRecord.id == job_id)
+            ).mappings().first()
         return Job.from_row(row) if row else None
 
     def list_jobs(
@@ -237,15 +198,12 @@ class JobStore:
         limit: int = 100,
     ) -> list[Job]:
         limit = max(1, min(limit, 1000))
-        query = "SELECT * FROM jobs"
-        parameters: list[Any] = []
+        query = select(JobRecord)
         if status is not None:
-            query += " WHERE status = ?"
-            parameters.append(str(status))
-        query += " ORDER BY created_at DESC LIMIT ?"
-        parameters.append(limit)
-        with closing(self._connect()) as connection:
-            rows = connection.execute(query, parameters).fetchall()
+            query = query.where(JobRecord.status == str(status))
+        query = query.order_by(JobRecord.created_at.desc()).limit(limit)
+        with self._reader() as connection:
+            rows = connection.execute(query).mappings().all()
         return [Job.from_row(row) for row in rows]
 
     def claim(
@@ -262,47 +220,46 @@ class JobStore:
             raise ValueError("lease_seconds must be positive")
         now = self.clock.now()
         claimed_ids: list[str] = []
-        with self._transaction() as connection:
-            rows = connection.execute(
-                """
-                SELECT id FROM jobs
-                WHERE queue = ?
-                  AND status = 'queued'
-                  AND cancel_requested = 0
-                  AND available_at <= ?
-                ORDER BY available_at, created_at, id
-                LIMIT ?
-                """,
-                (queue, now, limit),
-            ).fetchall()
+        with observability.CLAIM_LATENCY.time(), self._transaction() as connection:
+            selection = (
+                select(JobRecord.id)
+                .where(
+                    JobRecord.queue == queue,
+                    JobRecord.status == JobStatus.QUEUED.value,
+                    JobRecord.cancel_requested == 0,
+                    JobRecord.available_at <= now,
+                )
+                .order_by(JobRecord.available_at, JobRecord.created_at, JobRecord.id)
+                .limit(limit)
+            )
+            if self._skip_locked:
+                # Lock the candidate rows and skip any a concurrent claimant
+                # already holds, so claimants never queue behind each other.
+                selection = selection.with_for_update(skip_locked=True)
+            rows = connection.execute(selection).mappings().all()
             for row in rows:
                 token = str(uuid.uuid4())
                 changed = connection.execute(
-                    """
-                    UPDATE jobs
-                    SET status = 'running',
-                        attempts = attempts + 1,
-                        lease_owner = ?,
-                        lease_token = ?,
-                        lease_expires_at = ?,
-                        heartbeat_at = ?,
-                        updated_at = ?
-                    WHERE id = ? AND status = 'queued'
-                    """,
-                    (
-                        worker_id,
-                        token,
-                        now + lease_seconds,
-                        now,
-                        now,
-                        row["id"],
-                    ),
+                    update(JobRecord)
+                    .where(
+                        JobRecord.id == row["id"],
+                        JobRecord.status == JobStatus.QUEUED.value,
+                    )
+                    .values(
+                        status=JobStatus.RUNNING.value,
+                        attempts=JobRecord.attempts + 1,
+                        lease_owner=worker_id,
+                        lease_token=token,
+                        lease_expires_at=now + lease_seconds,
+                        heartbeat_at=now,
+                        updated_at=now,
+                    )
                 ).rowcount
                 if changed:
                     claimed_ids.append(row["id"])
                     attempt = connection.execute(
-                        "SELECT attempts FROM jobs WHERE id = ?", (row["id"],)
-                    ).fetchone()["attempts"]
+                        select(JobRecord.attempts).where(JobRecord.id == row["id"])
+                    ).scalar_one()
                     self._event(
                         connection,
                         row["id"],
@@ -314,11 +271,17 @@ class JobStore:
                     )
             if not claimed_ids:
                 return []
-            placeholders = ",".join("?" for _ in claimed_ids)
             claimed = connection.execute(
-                f"SELECT * FROM jobs WHERE id IN ({placeholders})",
-                claimed_ids,
-            ).fetchall()
+                select(JobRecord).where(JobRecord.id.in_(claimed_ids))
+            ).mappings().all()
+        observability.JOBS_CLAIMED.labels(queue=queue).inc(len(claimed_ids))
+        LOGGER.info(
+            "jobs claimed",
+            worker_id=worker_id,
+            queue=queue,
+            claimed=len(claimed_ids),
+            lease_seconds=lease_seconds,
+        )
         by_id = {row["id"]: Job.from_row(row) for row in claimed}
         return [by_id[job_id] for job_id in claimed_ids]
 
@@ -333,26 +296,26 @@ class JobStore:
         now = self.clock.now()
         with self._transaction() as connection:
             changed = connection.execute(
-                """
-                UPDATE jobs
-                SET lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
-                WHERE id = ?
-                  AND status = 'running'
-                  AND lease_owner = ?
-                  AND lease_token = ?
-                  AND cancel_requested = 0
-                  AND lease_expires_at > ?
-                """,
-                (
-                    now + lease_seconds,
-                    now,
-                    now,
-                    job_id,
-                    worker_id,
-                    lease_token,
-                    now,
-                ),
+                update(JobRecord)
+                .where(
+                    JobRecord.id == job_id,
+                    JobRecord.status == JobStatus.RUNNING.value,
+                    JobRecord.lease_owner == worker_id,
+                    JobRecord.lease_token == lease_token,
+                    JobRecord.cancel_requested == 0,
+                    JobRecord.lease_expires_at > now,
+                )
+                .values(
+                    lease_expires_at=now + lease_seconds,
+                    heartbeat_at=now,
+                    updated_at=now,
+                )
             ).rowcount
+        if changed != 1:
+            observability.STALE_FENCE_REJECTIONS.labels(operation="heartbeat").inc()
+            LOGGER.warning(
+                "heartbeat rejected by lease fence", job_id=job_id, worker_id=worker_id
+            )
         return changed == 1
 
     def complete(
@@ -365,30 +328,37 @@ class JobStore:
         now = self.clock.now()
         with self._transaction() as connection:
             row = connection.execute(
-                """
-                SELECT attempts, cancel_requested FROM jobs
-                WHERE id = ? AND status = 'running'
-                  AND lease_owner = ? AND lease_token = ?
-                  AND lease_expires_at > ?
-                """,
-                (job_id, worker_id, lease_token, now),
-            ).fetchone()
+                select(JobRecord.attempts, JobRecord.cancel_requested).where(
+                    JobRecord.id == job_id,
+                    JobRecord.status == JobStatus.RUNNING.value,
+                    JobRecord.lease_owner == worker_id,
+                    JobRecord.lease_token == lease_token,
+                    JobRecord.lease_expires_at > now,
+                )
+            ).mappings().first()
             if not row:
-                return False
-            if row["cancel_requested"]:
-                self._mark_cancelled(
-                    connection, job_id, worker_id, row["attempts"], now
+                observability.STALE_FENCE_REJECTIONS.labels(operation="complete").inc()
+                LOGGER.warning(
+                    "completion rejected by lease fence",
+                    job_id=job_id,
+                    worker_id=worker_id,
                 )
                 return False
+            if row["cancel_requested"]:
+                self._mark_cancelled(connection, job_id, worker_id, row["attempts"], now)
+                return False
             connection.execute(
-                """
-                UPDATE jobs
-                SET status = 'succeeded', result = ?, completed_at = ?,
-                    updated_at = ?, lease_owner = NULL, lease_token = NULL,
-                    lease_expires_at = NULL
-                WHERE id = ?
-                """,
-                (_json(result), now, now, job_id),
+                update(JobRecord)
+                .where(JobRecord.id == job_id)
+                .values(
+                    status=JobStatus.SUCCEEDED.value,
+                    result=_json(result),
+                    completed_at=now,
+                    updated_at=now,
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                )
             )
             self._event(
                 connection,
@@ -398,6 +368,9 @@ class JobStore:
                 attempt=row["attempts"],
                 now=now,
             )
+        LOGGER.info(
+            "job succeeded", job_id=job_id, worker_id=worker_id, attempt=row["attempts"]
+        )
         return True
 
     def fail(
@@ -410,20 +383,28 @@ class JobStore:
         now = self.clock.now()
         with self._transaction() as connection:
             row = connection.execute(
-                """
-                SELECT attempts, max_attempts, cancel_requested FROM jobs
-                WHERE id = ? AND status = 'running'
-                  AND lease_owner = ? AND lease_token = ?
-                  AND lease_expires_at > ?
-                """,
-                (job_id, worker_id, lease_token, now),
-            ).fetchone()
+                select(
+                    JobRecord.attempts,
+                    JobRecord.max_attempts,
+                    JobRecord.cancel_requested,
+                ).where(
+                    JobRecord.id == job_id,
+                    JobRecord.status == JobStatus.RUNNING.value,
+                    JobRecord.lease_owner == worker_id,
+                    JobRecord.lease_token == lease_token,
+                    JobRecord.lease_expires_at > now,
+                )
+            ).mappings().first()
             if not row:
+                observability.STALE_FENCE_REJECTIONS.labels(operation="fail").inc()
+                LOGGER.warning(
+                    "failure report rejected by lease fence",
+                    job_id=job_id,
+                    worker_id=worker_id,
+                )
                 return None
             if row["cancel_requested"]:
-                self._mark_cancelled(
-                    connection, job_id, worker_id, row["attempts"], now
-                )
+                self._mark_cancelled(connection, job_id, worker_id, row["attempts"], now)
                 return JobStatus.CANCELLED
             if row["attempts"] >= row["max_attempts"]:
                 status = JobStatus.DEAD_LETTER
@@ -434,22 +415,18 @@ class JobStore:
                 available_at = now + self.backoff_for(row["attempts"])
                 event_type = "retry_scheduled"
             connection.execute(
-                """
-                UPDATE jobs
-                SET status = ?, available_at = ?, last_error = ?,
-                    updated_at = ?, completed_at = ?,
-                    lease_owner = NULL, lease_token = NULL,
-                    lease_expires_at = NULL
-                WHERE id = ?
-                """,
-                (
-                    status.value,
-                    available_at,
-                    error[:4000],
-                    now,
-                    now if status == JobStatus.DEAD_LETTER else None,
-                    job_id,
-                ),
+                update(JobRecord)
+                .where(JobRecord.id == job_id)
+                .values(
+                    status=status.value,
+                    available_at=available_at,
+                    last_error=error[:4000],
+                    updated_at=now,
+                    completed_at=now if status == JobStatus.DEAD_LETTER else None,
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_expires_at=None,
+                )
             )
             self._event(
                 connection,
@@ -460,22 +437,41 @@ class JobStore:
                 detail={"error": error[:500], "available_at": available_at},
                 now=now,
             )
+        LOGGER.warning(
+            "job attempt failed",
+            job_id=job_id,
+            worker_id=worker_id,
+            attempt=row["attempts"],
+            outcome=status.value,
+            available_at=available_at,
+            error=error[:500],
+        )
         return status
 
     def recover_expired(self, *, limit: int = 1000) -> int:
         now = self.clock.now()
         recovered = 0
         with self._transaction() as connection:
-            rows = connection.execute(
-                """
-                SELECT id, attempts, max_attempts, lease_owner, cancel_requested
-                FROM jobs
-                WHERE status = 'running' AND lease_expires_at <= ?
-                ORDER BY lease_expires_at
-                LIMIT ?
-                """,
-                (now, limit),
-            ).fetchall()
+            selection = (
+                select(
+                    JobRecord.id,
+                    JobRecord.attempts,
+                    JobRecord.max_attempts,
+                    JobRecord.lease_owner,
+                    JobRecord.cancel_requested,
+                )
+                .where(
+                    JobRecord.status == JobStatus.RUNNING.value,
+                    JobRecord.lease_expires_at <= now,
+                )
+                .order_by(JobRecord.lease_expires_at)
+                .limit(limit)
+            )
+            if self._skip_locked:
+                # Several coordinators may sweep concurrently; skipping locked
+                # rows keeps each expired job with exactly one sweeper.
+                selection = selection.with_for_update(skip_locked=True)
+            rows = connection.execute(selection).mappings().all()
             for row in rows:
                 if row["cancel_requested"]:
                     self._mark_cancelled(
@@ -498,21 +494,21 @@ class JobStore:
                     completed_at = None
                     event_type = "lease_expired_requeued"
                 connection.execute(
-                    """
-                    UPDATE jobs
-                    SET status = ?, available_at = ?, updated_at = ?,
-                        completed_at = ?, last_error = 'worker lease expired',
-                        lease_owner = NULL, lease_token = NULL,
-                        lease_expires_at = NULL
-                    WHERE id = ? AND status = 'running'
-                    """,
-                    (
-                        status.value,
-                        available_at,
-                        now,
-                        completed_at,
-                        row["id"],
-                    ),
+                    update(JobRecord)
+                    .where(
+                        JobRecord.id == row["id"],
+                        JobRecord.status == JobStatus.RUNNING.value,
+                    )
+                    .values(
+                        status=status.value,
+                        available_at=available_at,
+                        updated_at=now,
+                        completed_at=completed_at,
+                        last_error="worker lease expired",
+                        lease_owner=None,
+                        lease_token=None,
+                        lease_expires_at=None,
+                    )
                 )
                 self._event(
                     connection,
@@ -523,6 +519,14 @@ class JobStore:
                     detail={"available_at": available_at},
                     now=now,
                 )
+                LOGGER.warning(
+                    "expired lease recovered",
+                    job_id=row["id"],
+                    worker_id=row["lease_owner"],
+                    attempt=row["attempts"],
+                    outcome=status.value,
+                    available_at=available_at,
+                )
                 recovered += 1
         return recovered
 
@@ -530,8 +534,8 @@ class JobStore:
         now = self.clock.now()
         with self._transaction() as connection:
             row = connection.execute(
-                "SELECT status, attempts FROM jobs WHERE id = ?", (job_id,)
-            ).fetchone()
+                select(JobRecord.status, JobRecord.attempts).where(JobRecord.id == job_id)
+            ).mappings().first()
             if not row or row["status"] in {
                 "succeeded",
                 "dead_letter",
@@ -542,11 +546,12 @@ class JobStore:
                 self._mark_cancelled(connection, job_id, None, row["attempts"], now)
             else:
                 connection.execute(
-                    """
-                    UPDATE jobs SET cancel_requested = 1, updated_at = ?
-                    WHERE id = ? AND status = 'running'
-                    """,
-                    (now, job_id),
+                    update(JobRecord)
+                    .where(
+                        JobRecord.id == job_id,
+                        JobRecord.status == JobStatus.RUNNING.value,
+                    )
+                    .values(cancel_requested=1, updated_at=now)
                 )
                 self._event(
                     connection,
@@ -555,48 +560,50 @@ class JobStore:
                     attempt=row["attempts"],
                     now=now,
                 )
+        LOGGER.info("cancellation accepted", job_id=job_id, previous_status=row["status"])
         return True
 
-    def acknowledge_cancellation(
-        self, job_id: str, worker_id: str, lease_token: str
-    ) -> bool:
+    def acknowledge_cancellation(self, job_id: str, worker_id: str, lease_token: str) -> bool:
         now = self.clock.now()
         with self._transaction() as connection:
             row = connection.execute(
-                """
-                SELECT attempts FROM jobs
-                WHERE id = ? AND status = 'running'
-                  AND cancel_requested = 1
-                  AND lease_owner = ? AND lease_token = ?
-                  AND lease_expires_at > ?
-                """,
-                (job_id, worker_id, lease_token, now),
-            ).fetchone()
+                select(JobRecord.attempts).where(
+                    JobRecord.id == job_id,
+                    JobRecord.status == JobStatus.RUNNING.value,
+                    JobRecord.cancel_requested == 1,
+                    JobRecord.lease_owner == worker_id,
+                    JobRecord.lease_token == lease_token,
+                    JobRecord.lease_expires_at > now,
+                )
+            ).mappings().first()
             if not row:
+                observability.STALE_FENCE_REJECTIONS.labels(
+                    operation="acknowledge_cancellation"
+                ).inc()
                 return False
-            self._mark_cancelled(
-                connection, job_id, worker_id, row["attempts"], now
-            )
+            self._mark_cancelled(connection, job_id, worker_id, row["attempts"], now)
         return True
 
     def _mark_cancelled(
         self,
-        connection: sqlite3.Connection,
+        connection: Connection,
         job_id: str,
         worker_id: str | None,
         attempt: int,
         now: float,
     ) -> None:
         connection.execute(
-            """
-            UPDATE jobs
-            SET status = 'cancelled', cancel_requested = 1,
-                completed_at = ?, updated_at = ?,
-                lease_owner = NULL, lease_token = NULL,
-                lease_expires_at = NULL
-            WHERE id = ?
-            """,
-            (now, now, job_id),
+            update(JobRecord)
+            .where(JobRecord.id == job_id)
+            .values(
+                status=JobStatus.CANCELLED.value,
+                cancel_requested=1,
+                completed_at=now,
+                updated_at=now,
+                lease_owner=None,
+                lease_token=None,
+                lease_expires_at=None,
+            )
         )
         self._event(
             connection,
@@ -611,86 +618,107 @@ class JobStore:
         now = self.clock.now()
         with self._transaction() as connection:
             changed = connection.execute(
-                """
-                UPDATE jobs
-                SET status = 'queued', attempts = 0, available_at = ?,
-                    updated_at = ?, completed_at = NULL, last_error = NULL,
-                    cancel_requested = 0
-                WHERE id = ? AND status = 'dead_letter'
-                """,
-                (now, now, job_id),
+                update(JobRecord)
+                .where(
+                    JobRecord.id == job_id,
+                    JobRecord.status == JobStatus.DEAD_LETTER.value,
+                )
+                .values(
+                    status=JobStatus.QUEUED.value,
+                    attempts=0,
+                    available_at=now,
+                    updated_at=now,
+                    completed_at=None,
+                    last_error=None,
+                    cancel_requested=0,
+                )
             ).rowcount
             if changed:
                 self._event(
                     connection, job_id, "redriven", detail={"attempts_reset": True}, now=now
                 )
+                LOGGER.info("dead-letter job redriven", job_id=job_id)
         return changed == 1
 
-    def cancellation_requested(
-        self, job_id: str, worker_id: str, lease_token: str
-    ) -> bool:
-        with closing(self._connect()) as connection:
+    def cancellation_requested(self, job_id: str, worker_id: str, lease_token: str) -> bool:
+        with self._reader() as connection:
             row = connection.execute(
-                """
-                SELECT cancel_requested, lease_expires_at FROM jobs
-                WHERE id = ? AND status = 'running'
-                  AND lease_owner = ? AND lease_token = ?
-                """,
-                (job_id, worker_id, lease_token),
-            ).fetchone()
+                select(JobRecord.cancel_requested, JobRecord.lease_expires_at).where(
+                    JobRecord.id == job_id,
+                    JobRecord.status == JobStatus.RUNNING.value,
+                    JobRecord.lease_owner == worker_id,
+                    JobRecord.lease_token == lease_token,
+                )
+            ).mappings().first()
         return (
             row is None
             or bool(row["cancel_requested"])
             or row["lease_expires_at"] <= self.clock.now()
         )
 
-    def register_worker(
-        self, worker_id: str, queue: str, capacity: int, in_flight: int
-    ) -> None:
+    def register_worker(self, worker_id: str, queue: str, capacity: int, in_flight: int) -> None:
         now = self.clock.now()
         with self._transaction() as connection:
-            connection.execute(
-                """
-                INSERT INTO workers
-                    (worker_id, queue, capacity, in_flight, last_seen_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(worker_id) DO UPDATE SET
-                    queue = excluded.queue,
-                    capacity = excluded.capacity,
-                    in_flight = excluded.in_flight,
-                    last_seen_at = excluded.last_seen_at
-                """,
-                (worker_id, queue, capacity, in_flight, now),
-            )
+            # Portable upsert: the dialect-specific ON CONFLICT syntaxes differ,
+            # and this row is an ephemeral liveness snapshot rather than part of
+            # any correctness-critical transition.
+            updated = connection.execute(
+                update(WorkerRecord)
+                .where(WorkerRecord.worker_id == worker_id)
+                .values(
+                    queue=queue,
+                    capacity=capacity,
+                    in_flight=in_flight,
+                    last_seen_at=now,
+                )
+            ).rowcount
+            if not updated:
+                connection.execute(
+                    insert(WorkerRecord).values(
+                        worker_id=worker_id,
+                        queue=queue,
+                        capacity=capacity,
+                        in_flight=in_flight,
+                        last_seen_at=now,
+                    )
+                )
 
     def record_effect(self, job_id: str, effect_key: str, value: Any) -> tuple[Any, bool]:
         """Persist an application-side idempotent effect in the same database."""
         now = self.clock.now()
         with self._transaction() as connection:
             existing = connection.execute(
-                "SELECT value FROM effects WHERE job_id = ? AND effect_key = ?",
-                (job_id, effect_key),
-            ).fetchone()
+                select(EffectRecord.value).where(
+                    EffectRecord.job_id == job_id,
+                    EffectRecord.effect_key == effect_key,
+                )
+            ).mappings().first()
             if existing:
                 return json.loads(existing["value"]), False
             connection.execute(
-                """
-                INSERT INTO effects (job_id, effect_key, value, recorded_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (job_id, effect_key, _json(value), now),
+                insert(EffectRecord).values(
+                    job_id=job_id,
+                    effect_key=effect_key,
+                    value=_json(value),
+                    recorded_at=now,
+                )
             )
         return value, True
 
     def events(self, job_id: str) -> list[dict[str, Any]]:
-        with closing(self._connect()) as connection:
+        with self._reader() as connection:
             rows = connection.execute(
-                """
-                SELECT sequence, event_type, worker_id, attempt, detail, occurred_at
-                FROM job_events WHERE job_id = ? ORDER BY sequence
-                """,
-                (job_id,),
-            ).fetchall()
+                select(
+                    JobEventRecord.sequence,
+                    JobEventRecord.event_type,
+                    JobEventRecord.worker_id,
+                    JobEventRecord.attempt,
+                    JobEventRecord.detail,
+                    JobEventRecord.occurred_at,
+                )
+                .where(JobEventRecord.job_id == job_id)
+                .order_by(JobEventRecord.sequence)
+            ).mappings().all()
         return [
             {
                 "sequence": row["sequence"],
@@ -703,34 +731,43 @@ class JobStore:
             for row in rows
         ]
 
+    def purge(self) -> None:
+        """Delete all rows. Used by the benchmark and Postgres test fixtures."""
+        with self._transaction() as connection:
+            connection.execute(delete(JobEventRecord))
+            connection.execute(delete(EffectRecord))
+            connection.execute(delete(WorkerRecord))
+            connection.execute(delete(JobRecord))
+
     def metrics(self) -> dict[str, Any]:
         now = self.clock.now()
-        with closing(self._connect()) as connection:
+        with self._reader() as connection:
             statuses = {
                 row["status"]: row["count"]
                 for row in connection.execute(
-                    "SELECT status, COUNT(*) AS count FROM jobs GROUP BY status"
-                )
+                    select(JobRecord.status, func.count().label("count")).group_by(
+                        JobRecord.status
+                    )
+                ).mappings()
             }
             event_totals = {
                 row["event_type"]: row["count"]
                 for row in connection.execute(
-                    """
-                    SELECT event_type, COUNT(*) AS count
-                    FROM job_events GROUP BY event_type
-                    """
-                )
+                    select(
+                        JobEventRecord.event_type, func.count().label("count")
+                    ).group_by(JobEventRecord.event_type)
+                ).mappings()
             }
             oldest = connection.execute(
-                """
-                SELECT MIN(created_at) AS created_at FROM jobs
-                WHERE status = 'queued'
-                """
-            ).fetchone()["created_at"]
+                select(func.min(JobRecord.created_at)).where(
+                    JobRecord.status == JobStatus.QUEUED.value
+                )
+            ).scalar()
             active_workers = connection.execute(
-                "SELECT COUNT(*) AS count FROM workers WHERE last_seen_at >= ?",
-                (now - 30,),
-            ).fetchone()["count"]
+                select(func.count())
+                .select_from(WorkerRecord)
+                .where(WorkerRecord.last_seen_at >= now - 30)
+            ).scalar_one()
         return {
             "jobs": {status.value: statuses.get(status.value, 0) for status in JobStatus},
             "events": event_totals,
@@ -739,33 +776,15 @@ class JobStore:
         }
 
     def prometheus_metrics(self) -> str:
-        snapshot = self.metrics()
-        lines = [
-            "# HELP durableflow_jobs Current jobs by state.",
-            "# TYPE durableflow_jobs gauge",
-        ]
-        for status, count in snapshot["jobs"].items():
-            lines.append(f'durableflow_jobs{{status="{status}"}} {count}')
-        lines.extend(
-            [
-                "# HELP durableflow_events_total Persisted state transition events.",
-                "# TYPE durableflow_events_total counter",
-            ]
-        )
-        for event, count in sorted(snapshot["events"].items()):
-            lines.append(f'durableflow_events_total{{event="{event}"}} {count}')
-        lines.extend(
-            [
-                "# HELP durableflow_active_workers Workers seen in the last 30 seconds.",
-                "# TYPE durableflow_active_workers gauge",
-                f"durableflow_active_workers {snapshot['active_workers']}",
-                "# HELP durableflow_oldest_queued_age_seconds Age of the oldest queued job.",
-                "# TYPE durableflow_oldest_queued_age_seconds gauge",
-                "durableflow_oldest_queued_age_seconds "
-                f"{snapshot['oldest_queued_age_seconds']:.6f}",
-            ]
-        )
-        return "\n".join(lines) + "\n"
+        """Render the Prometheus text exposition for this store's registry.
+
+        Gauges are refreshed from the database on every scrape so a restarted
+        process reports true queue depth instead of its own process-local view.
+        """
+        from prometheus_client import generate_latest
+
+        observability.refresh_gauges(self.metrics())
+        return generate_latest(observability.REGISTRY).decode()
 
     def backoff_for(self, attempts: int) -> float:
         return min(self.max_backoff, self.base_backoff * (2 ** max(0, attempts - 1)))
