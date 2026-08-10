@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -11,16 +12,31 @@ from durableflow.models import JobStatus
 from durableflow.store import JobStore
 
 
-def run_chaos_scenario() -> dict[str, Any]:
-    """Run a deterministic crash/retry/fencing scenario with no sleeps."""
-    with tempfile.TemporaryDirectory(prefix="durableflow-chaos-") as directory:
+def run_chaos_scenario(*, database_url: str | None = None) -> dict[str, Any]:
+    """Run a deterministic crash/retry/fencing scenario with no sleeps.
+
+    The scenario drives a manual clock, so lease expiry and backoff are exact
+    rather than timing-dependent. Passing ``database_url`` runs the same
+    assertions against a real backend (for example PostgreSQL), which is how the
+    ``FOR UPDATE SKIP LOCKED`` claim path is proven to preserve fencing.
+    """
+    with ExitStack() as stack:
         clock = ManualClock()
-        store = JobStore(
-            Path(directory) / "chaos.db",
-            clock=clock,
-            base_backoff=1,
-            max_backoff=8,
-        )
+        if database_url:
+            store = JobStore(database_url, clock=clock, base_backoff=1, max_backoff=8)
+            # Assertions below count events and states, so start from an empty queue.
+            store.purge()
+        else:
+            directory = stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="durableflow-chaos-")
+            )
+            store = JobStore(
+                Path(directory) / "chaos.db",
+                clock=clock,
+                base_backoff=1,
+                max_backoff=8,
+            )
+        stack.callback(store.close)
         coordinator = Coordinator(store)
 
         crash_job = store.submit(
@@ -133,13 +149,40 @@ def run_chaos_scenario() -> dict[str, Any]:
                 },
             },
             "metrics": store.metrics(),
+            "backend": store.engine.dialect.name,
+            "claim_strategy": (
+                "SELECT ... FOR UPDATE SKIP LOCKED"
+                if store.uses_skip_locked
+                else "BEGIN IMMEDIATE + conditional UPDATE"
+            ),
         }
-        store.close()
         return result
 
 
 def main() -> None:
-    print(json.dumps(run_chaos_scenario(), indent=2, sort_keys=True))
+    import argparse
+
+    from durableflow import observability
+
+    argument_parser = argparse.ArgumentParser(
+        prog="durableflow.chaos",
+        description="Deterministic crash/retry/recovery assertions",
+    )
+    argument_parser.add_argument(
+        "--database",
+        default=None,
+        help="Run the scenario against this URL instead of a temporary SQLite database.",
+    )
+    arguments = argument_parser.parse_args()
+    # The JSON trace on stdout is the artifact; keep expected warnings out of it.
+    observability.configure_logging(level="ERROR", json_logs=True)
+    print(
+        json.dumps(
+            run_chaos_scenario(database_url=arguments.database),
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":

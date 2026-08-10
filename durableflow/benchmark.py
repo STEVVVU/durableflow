@@ -4,6 +4,7 @@ import json
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -15,11 +16,32 @@ def run_benchmark(
     jobs: int = 2000,
     workers: int = 8,
     claim_batch: int = 16,
+    database_url: str | None = None,
 ) -> dict[str, Any]:
+    """Measure durable submission and claim-plus-completion throughput.
+
+    Passing ``database_url`` benchmarks a real backend (for example PostgreSQL,
+    which claims with ``FOR UPDATE SKIP LOCKED``); otherwise a temporary local
+    SQLite WAL database is used. Every state transition still commits with its
+    audit event, and neither submissions nor completions are batched, so the
+    numbers stay comparable across backends.
+    """
     if jobs < 1 or workers < 1 or claim_batch < 1:
         raise ValueError("jobs, workers, and claim_batch must be positive")
-    with tempfile.TemporaryDirectory(prefix="durableflow-bench-") as directory:
-        store = JobStore(Path(directory) / "benchmark.db")
+    with ExitStack() as stack:
+        if database_url:
+            store = JobStore(database_url)
+            # Reuse of a persistent database must start from a clean queue, or
+            # leftover rows would corrupt the completion assertions below.
+            store.purge()
+            description = store.engine.url.render_as_string(hide_password=True)
+        else:
+            directory = stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="durableflow-bench-")
+            )
+            store = JobStore(Path(directory) / "benchmark.db")
+            description = "temporary local SQLite WAL"
+        stack.callback(store.close)
 
         submit_started = time.perf_counter()
         for number in range(jobs):
@@ -78,7 +100,11 @@ def run_benchmark(
         assert completed == jobs
         assert metrics["jobs"]["succeeded"] == jobs
         result = {
-            "benchmark": "sqlite_wal_claim_and_complete",
+            "benchmark": (
+                "postgres_skip_locked_claim_and_complete"
+                if store.uses_skip_locked
+                else "sqlite_wal_claim_and_complete"
+            ),
             "jobs": jobs,
             "workers": workers,
             "claim_batch": claim_batch,
@@ -86,18 +112,50 @@ def run_benchmark(
             "submit_jobs_per_second": round(jobs / submit_seconds, 2),
             "drain_seconds": round(drain_seconds, 6),
             "drain_jobs_per_second": round(jobs / drain_seconds, 2),
-            "end_to_end_jobs_per_second": round(
-                jobs / (submit_seconds + drain_seconds), 2
-            ),
+            "end_to_end_jobs_per_second": round(jobs / (submit_seconds + drain_seconds), 2),
             "completed": completed,
-            "database": "temporary local SQLite WAL",
+            "database": description,
+            "claim_strategy": (
+                "SELECT ... FOR UPDATE SKIP LOCKED"
+                if store.uses_skip_locked
+                else "BEGIN IMMEDIATE + conditional UPDATE"
+            ),
         }
-        store.close()
         return result
 
 
 def main() -> None:
-    print(json.dumps(run_benchmark(), indent=2, sort_keys=True))
+    import argparse
+
+    from durableflow import observability
+
+    argument_parser = argparse.ArgumentParser(
+        prog="durableflow.benchmark",
+        description="Reproducible claim-and-complete throughput benchmark",
+    )
+    argument_parser.add_argument("--jobs", type=int, default=2000)
+    argument_parser.add_argument("--workers", type=int, default=8)
+    argument_parser.add_argument("--claim-batch", type=int, default=16)
+    argument_parser.add_argument(
+        "--database",
+        default=None,
+        help="Benchmark this URL instead of a temporary SQLite database.",
+    )
+    arguments = argument_parser.parse_args()
+    # Benchmark output is the JSON document on stdout; keep logs from interleaving.
+    observability.configure_logging(level="WARNING", json_logs=True)
+    print(
+        json.dumps(
+            run_benchmark(
+                jobs=arguments.jobs,
+                workers=arguments.workers,
+                claim_batch=arguments.claim_batch,
+                database_url=arguments.database,
+            ),
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":
