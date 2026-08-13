@@ -5,8 +5,10 @@ API/coordinator/worker boundaries. It persists jobs and transition history in
 SQLite WAL, assigns fenced worker leases, recovers abandoned work, retries with
 exponential backoff, and isolates exhausted jobs for operator redrive.
 
-It uses only Python 3.11+ standard-library modules. No Docker or hosted service
-is required.
+It runs on Python 3.11+ with a pip-installable dependency set. The default
+backend is a local SQLite file, so no external service is required to run it,
+test it, or reproduce its measurements. PostgreSQL is an opt-in backend
+selected by a connection string.
 
 ## What it implements
 
@@ -24,22 +26,48 @@ idempotent; see [the failure model](docs/failure-model.md).
 
 ## Run locally
 
-No installation is needed from the repository root. Start each boundary in a
-separate terminal against the same database:
+Create a virtual environment and install the package. The default database is a
+local SQLite file, so this is the whole setup:
 
 ```powershell
-python -m durableflow.cli --database .durableflow/jobs.db api
-python -m durableflow.cli --database .durableflow/jobs.db coordinator
-python -m durableflow.cli --database .durableflow/jobs.db worker --concurrency 4
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+```
+
+Start each boundary in a separate terminal against the same database:
+
+```powershell
+durableflow --database .durableflow/jobs.db api
+durableflow --database .durableflow/jobs.db coordinator
+durableflow --database .durableflow/jobs.db worker --concurrency 4
 ```
 
 Submit a job through the CLI:
 
 ```powershell
-python -m durableflow.cli --database .durableflow/jobs.db submit `
+durableflow --database .durableflow/jobs.db submit `
   '{"task":"flaky","failures_before_success":1}' `
   --idempotency-key demo-1 --max-attempts 3
 ```
+
+### Opt in to PostgreSQL
+
+SQLite is the zero-setup default. To run against PostgreSQL instead, install the
+extra and point `DURABLEFLOW_DATABASE_URL` (or `--database`) at your own server,
+then apply the migrations:
+
+```powershell
+python -m pip install -e ".[postgres]"
+$env:DURABLEFLOW_DATABASE_URL = "postgresql+psycopg://user:password@host:5432/durableflow"
+durableflow migrate
+```
+
+The backend changes the claim primitive, not the guarantees: PostgreSQL claims
+with `SELECT ... FOR UPDATE SKIP LOCKED` so concurrent claimants skip each
+other's locked rows, while SQLite serializes claims under the `BEGIN IMMEDIATE`
+write lock. Both issue the same fenced update afterwards. Provisioning a
+PostgreSQL server is out of scope for this repository.
 
 The HTTP surface includes:
 
@@ -61,9 +89,19 @@ behavior straightforward to reproduce.
 ## Verify failure behavior
 
 ```powershell
-python -m unittest discover -v
+ruff check .
+pytest
 python -m durableflow.chaos
 python -m durableflow.benchmark
+```
+
+All four run against SQLite and need no external service. The PostgreSQL tests
+are marked `postgres` and skip unless `DURABLEFLOW_TEST_POSTGRES_URL` names a
+reachable database, so a clean checkout never fails for want of a server:
+
+```powershell
+$env:DURABLEFLOW_TEST_POSTGRES_URL = "postgresql+psycopg://user:password@host:5432/durableflow_test"
+pytest -m postgres
 ```
 
 The chaos harness advances a manual clock rather than sleeping. It asserts an
@@ -89,9 +127,11 @@ The benchmark includes a commit and audit event per state transition and does
 not batch submissions or completions. Reproduce it with
 `python -m durableflow.benchmark`; JSON output records all parameters.
 
-The final local verification passed 9 tests in 2.799 seconds, including a
-live localhost HTTP contract test. CI runs the full suite and both harnesses
-on Python 3.11-3.13.
+The final local verification passed 41 tests in 25.10 seconds, including an
+in-process FastAPI contract test; the 5 PostgreSQL tests skipped, since no
+database was configured. CI runs lint, the SQLite suite, and the chaos harness
+on Python 3.11-3.13, and runs the PostgreSQL-marked tests plus the chaos
+harness against a PostgreSQL service the GitHub runner provides.
 
 ## Design
 

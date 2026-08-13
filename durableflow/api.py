@@ -178,8 +178,9 @@ def _register_routes(app: FastAPI) -> None:
     async def readyz(store: StoreDep, response: Response) -> ReadinessResponse:
         """Readiness: the database is reachable, so work can actually be accepted.
 
-        This is the container healthcheck target. It fails closed with 503 so an
-        orchestrator replaces a replica that has lost its database.
+        This is the probe target for whatever supervises the process. It fails
+        closed with 503 rather than reporting healthy, so a supervisor can pull a
+        replica that has lost its database out of rotation.
         """
         backend = store.engine.dialect.name
         try:

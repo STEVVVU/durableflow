@@ -2,7 +2,7 @@
 
 The default backend is SQLite so the suite runs with no external services. Tests
 marked ``postgres`` are skipped unless ``DURABLEFLOW_TEST_POSTGRES_URL`` points at
-a reachable database; CI supplies one via a ``services: postgres`` container.
+a reachable database; CI supplies one from the runner's ``services: postgres``.
 """
 
 from __future__ import annotations
