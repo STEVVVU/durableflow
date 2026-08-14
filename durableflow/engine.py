@@ -24,6 +24,14 @@ from sqlalchemy.pool import QueuePool
 
 SQLITE_PREFIXES = ("sqlite:", "sqlite+pysqlite:")
 
+# How long a SQLite writer waits for the database-wide write lock before raising
+# "database is locked". SQLite has exactly one writer, so N claimant threads form
+# a lock convoy: median wait stays low but the tail grows with concurrency and
+# batch size. 10s was measurably too tight at 8 claimants draining thousands of
+# jobs. This is a wait bound, not a correctness knob -- a writer that gives up
+# simply raises, and the job stays claimable.
+SQLITE_BUSY_TIMEOUT_SECONDS = 60.0
+
 
 def normalize_url(url: str | Path) -> str:
     """Accept a bare filesystem path as shorthand for a local SQLite database."""
@@ -49,7 +57,13 @@ def _sqlite_path(url: str) -> str | None:
     return remainder
 
 
-def create_db_engine(url: str | Path, *, pool_size: int = 16, echo: bool = False) -> Engine:
+def create_db_engine(
+    url: str | Path,
+    *,
+    pool_size: int = 16,
+    echo: bool = False,
+    busy_timeout_seconds: float = SQLITE_BUSY_TIMEOUT_SECONDS,
+) -> Engine:
     """Build a configured engine, applying the dialect's durability settings."""
     resolved = normalize_url(url)
 
@@ -66,9 +80,12 @@ def create_db_engine(url: str | Path, *, pool_size: int = 16, echo: bool = False
             poolclass=QueuePool,
             pool_size=pool_size,
             max_overflow=pool_size,
-            connect_args={"timeout": 10, "check_same_thread": False},
+            connect_args={
+                "timeout": busy_timeout_seconds,
+                "check_same_thread": False,
+            },
         )
-        _install_sqlite_semantics(engine)
+        _install_sqlite_semantics(engine, busy_timeout_seconds=busy_timeout_seconds)
         return engine
 
     if resolved.startswith("postgresql://"):
@@ -85,7 +102,14 @@ def create_db_engine(url: str | Path, *, pool_size: int = 16, echo: bool = False
     )
 
 
-def _install_sqlite_semantics(engine: Engine) -> None:
+# Execution-option flag marking a connection as a write transaction that must
+# take the SQLite write lock up front.
+WRITE_TRANSACTION_OPTION = "durableflow_write"
+
+
+def _install_sqlite_semantics(
+    engine: Engine, *, busy_timeout_seconds: float = SQLITE_BUSY_TIMEOUT_SECONDS
+) -> None:
     """Restore WAL, busy-timeout, and explicit ``BEGIN IMMEDIATE`` write locking.
 
     pysqlite's driver-level transaction handling both opens transactions lazily
@@ -94,6 +118,12 @@ def _install_sqlite_semantics(engine: Engine) -> None:
     read-then-write race the original ``BEGIN IMMEDIATE`` was chosen to exclude.
     Disabling the driver's implicit transaction and emitting our own keeps the
     claim protocol unchanged.
+
+    Crucially, ``BEGIN IMMEDIATE`` is emitted **only** for connections explicitly
+    marked as write transactions. SQLAlchemy fires the ``begin`` event for read
+    connections too, so promoting every one would make each ``get``/``list_jobs``/
+    ``metrics`` call acquire the database-wide write lock -- serialising readers
+    against writers and defeating the entire point of WAL mode.
     """
 
     @event.listens_for(engine, "connect")
@@ -103,14 +133,24 @@ def _install_sqlite_semantics(engine: Engine) -> None:
         try:
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute("PRAGMA busy_timeout=10000")
+            cursor.execute(f"PRAGMA busy_timeout={int(busy_timeout_seconds * 1000)}")
             cursor.execute("PRAGMA synchronous=NORMAL")
         finally:
             cursor.close()
 
     @event.listens_for(engine, "begin")
     def _begin_immediate(connection):  # noqa: ANN001
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if connection.get_execution_options().get(WRITE_TRANSACTION_OPTION):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+
+
+def begin_write(engine: Engine):  # noqa: ANN201 - SQLAlchemy context manager type
+    """Open a write transaction, taking SQLite's write lock immediately.
+
+    On PostgreSQL this is an ordinary transaction; isolation for claims comes
+    from ``FOR UPDATE SKIP LOCKED`` row locks in the query itself.
+    """
+    return engine.execution_options(**{WRITE_TRANSACTION_OPTION: True}).begin()
 
 
 def create_schema(engine: Engine) -> None:

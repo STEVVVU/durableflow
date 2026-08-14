@@ -47,6 +47,79 @@ def test_sqlite_engine_applies_wal_and_immediate_transactions(tmp_path: Path) ->
     engine.dispose()
 
 
+def test_begin_immediate_is_scoped_to_write_transactions(tmp_path: Path) -> None:
+    """Read connections must not take SQLite's write lock.
+
+    Regression guard: SQLAlchemy fires the ``begin`` event for read connections
+    too. Emitting ``BEGIN IMMEDIATE`` unconditionally makes every read acquire
+    the database-wide write lock, which serialises readers against writers,
+    negates WAL mode, and produces "database is locked" under concurrency.
+    """
+    from sqlalchemy import event, text
+
+    from durableflow.engine import begin_write
+
+    engine = create_db_engine(f"sqlite+pysqlite:///{tmp_path / 'scoped.db'}")
+    with begin_write(engine) as connection:
+        connection.execute(text("CREATE TABLE t (id INTEGER PRIMARY KEY)"))
+
+    immediate_begins: list[str] = []
+
+    @event.listens_for(engine, "begin")
+    def _spy(connection) -> None:  # noqa: ANN001
+        if connection.get_execution_options().get("durableflow_write"):
+            immediate_begins.append("write")
+        else:
+            immediate_begins.append("read")
+
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
+    assert immediate_begins == ["read"], "read path must not be marked as a write"
+
+    immediate_begins.clear()
+    with begin_write(engine) as connection:
+        connection.execute(text("INSERT INTO t VALUES (1)"))
+    assert immediate_begins == ["write"]
+
+    # A reader must not block while a write transaction is open.
+    with begin_write(engine) as writer:
+        writer.execute(text("INSERT INTO t VALUES (2)"))
+        with engine.connect() as reader:
+            assert reader.execute(text("SELECT count(*) FROM t")).scalar_one() == 1
+
+    engine.dispose()
+
+
+def test_concurrent_writers_do_not_raise_database_is_locked(tmp_path: Path) -> None:
+    """Concurrent write transactions must serialise via busy_timeout, not fail."""
+    import threading
+
+    from durableflow.store import JobStore
+
+    store = JobStore(tmp_path / "contended.db")
+    errors: list[str] = []
+
+    def submit_many(worker: int) -> None:
+        try:
+            for number in range(10):
+                store.submit(
+                    {"task": "echo", "value": number},
+                    idempotency_key=f"{worker}-{number}",
+                )
+        except Exception as error:  # noqa: BLE001 - recorded for the assertion
+            errors.append(repr(error))
+
+    threads = [threading.Thread(target=submit_many, args=(worker,)) for worker in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(store.list_jobs(limit=1000)) == 80
+    store.close()
+
+
 def test_sqlite_parent_directory_is_created(tmp_path: Path) -> None:
     target = tmp_path / "nested" / "deeper" / "jobs.db"
     engine = create_db_engine(f"sqlite+pysqlite:///{target}")

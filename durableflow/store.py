@@ -12,7 +12,13 @@ from sqlalchemy.engine import Connection
 
 from durableflow import observability
 from durableflow.clock import SystemClock
-from durableflow.engine import create_db_engine, create_schema, is_postgres, normalize_url
+from durableflow.engine import (
+    begin_write,
+    create_db_engine,
+    create_schema,
+    is_postgres,
+    normalize_url,
+)
 from durableflow.models import Job, JobStatus, Submission
 from durableflow.orm import EffectRecord, JobEventRecord, JobRecord, WorkerRecord
 
@@ -78,16 +84,18 @@ class JobStore:
     def _transaction(self) -> Iterator[Connection]:
         """Run one write transaction.
 
-        On SQLite the engine's ``begin`` hook emits ``BEGIN IMMEDIATE``, so the
-        write lock is held for the whole block and a claim's read cannot
-        interleave with another claimant's write. On PostgreSQL isolation comes
-        from row locks taken inside the claim query itself.
+        On SQLite this emits ``BEGIN IMMEDIATE``, so the write lock is held for
+        the whole block and a claim's read cannot interleave with another
+        claimant's write. On PostgreSQL isolation comes from row locks taken
+        inside the claim query itself. Read paths deliberately use ``_reader``
+        instead, so they never contend for the write lock.
         """
-        with self._engine.begin() as connection:
+        with begin_write(self._engine) as connection:
             yield connection
 
     @contextmanager
     def _reader(self) -> Iterator[Connection]:
+        """Run a read-only query outside any write transaction."""
         with self._engine.connect() as connection:
             yield connection
 
