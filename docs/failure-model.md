@@ -2,7 +2,13 @@
 
 ## Guarantees
 
-- **Durable accepted jobs:** A successful submit response follows the SQLite
+These hold identically on PostgreSQL and SQLite. The backends differ only in how
+a claim obtains isolation (`SELECT ... FOR UPDATE SKIP LOCKED` versus
+`BEGIN IMMEDIATE`); both then issue the same conditional, fenced writes, and
+`tests/test_postgres.py` replays the fencing and chaos assertions against
+PostgreSQL to demonstrate it.
+
+- **Durable accepted jobs:** A successful submit response follows the database
   transaction commit.
 - **At-least-once execution:** A worker can execute a handler and fail before
   recording completion. The coordinator will eventually redeliver it.
@@ -41,13 +47,32 @@ outbox/inbox transaction. The included `ledger_write` task demonstrates
 deduplication with a unique `(job_id, effect_key)` record. It does not claim
 exactly-once execution.
 
+## Backend-specific contention
+
+SQLite permits exactly one writer. With N claimant threads the write lock forms a
+convoy: measured median wait stays a few milliseconds, but the tail grows with
+concurrency and batch size. A writer that exceeds `busy_timeout` raises
+`database is locked`; the transaction never partially applies, and the job simply
+stays claimable, so this is an availability limit and not a correctness one. The
+default wait is 60s (`SQLITE_BUSY_TIMEOUT_SECONDS`) after 10s proved too tight at
+8 claimants draining thousands of jobs.
+
+PostgreSQL does not have this bottleneck: `SKIP LOCKED` means concurrent
+claimants take disjoint row locks and never queue behind one another, which is
+the main reason it is the production backend.
+
 ## Explicit non-goals and limits
 
-- SQLite is a single-host persistence layer, not replicated consensus.
+- SQLite is a single-host, single-writer persistence layer, not replicated
+  consensus. PostgreSQL raises the concurrency ceiling but is still one database,
+  not a replicated multi-region control plane.
 - There is no authentication, authorization, TLS termination, tenant quota,
   or payload encryption.
 - Cancellation is cooperative while a handler is executing. A lost worker's
   cancellation becomes final when its lease expires.
-- Wall-clock changes can affect lease timing. All included processes are
-  expected to run on one host against one database.
+- Wall-clock changes can affect lease timing. Leases are wall-clock intervals
+  measured against one database, so severe skew between hosts affects timing.
 - Event rows grow without retention or archival in this version.
+- There is no deterministic workflow replay, multi-step workflow orchestration,
+  or versioning of in-flight work. See [the Temporal comparison](vs-temporal.md)
+  for what that would require and why it is out of scope.
