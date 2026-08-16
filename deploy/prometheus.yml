@@ -1,0 +1,13 @@
+# Scrape config for the compose stack. The API exposes queue depth, retry, DLQ,
+# and lease-expiry series on /metrics.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: durableflow-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8080"]
+        labels:
+          service: durableflow
