@@ -94,27 +94,22 @@ demonstrate that.
 exactly one writer, so N claimant threads form a lock convoy; `SKIP LOCKED` lets
 claimants take disjoint row locks and never queue behind one another.
 
-### Run the whole stack with Docker Compose
+### Scrape the metrics
 
-`compose.yaml` brings up the API, coordinator, worker, PostgreSQL, and Prometheus.
-Migrations run to completion before any process starts, so nothing races an
-incomplete schema:
+The API process exposes Prometheus text exposition on `/metrics`, so a local
+Prometheus can scrape it with nothing more than a scrape target pointed at the
+API's address:
 
-```powershell
-docker compose up --build
-docker compose up --build --scale worker=3   # workers are safe to scale: each claim is lease-fenced
+```yaml
+scrape_configs:
+  - job_name: durableflow
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
 ```
 
-The API is then on `http://127.0.0.1:8080` (OpenAPI docs at `/docs`) and
-Prometheus on `http://127.0.0.1:9090`. The image is built from
-`python:3.12-slim`, runs as a non-root user, and its `HEALTHCHECK` polls
-`/readyz`, which fails closed when the database is unreachable.
-
-> The container files have **not** been verified by an actual `docker build`: the
-> Docker daemon was unavailable in the environment where this change was made.
-> `docker compose config` validates, and the wheel the image installs builds and
-> exposes the `durableflow` entry point, but treat the image itself as unverified
-> until CI's `docker` job (which builds it and probes `/readyz`) runs green.
+Running more than one worker needs no coordination: workers are stateless and
+every claim is lease-fenced, so starting additional `durableflow worker`
+processes against the same database is safe.
 
 The HTTP surface includes:
 
@@ -224,8 +219,8 @@ the JSON output records every parameter, the backend, and the claim strategy.
 The final local verification passed 41 tests in 21.98 seconds, including a live
 uvicorn socket test; the 5 PostgreSQL tests skipped, since no database was
 configured. CI runs lint, the SQLite suite, and the chaos harness on Python
-3.11-3.13; runs the PostgreSQL-marked tests plus the chaos harness against a
-PostgreSQL service container; and builds the Docker image and probes `/readyz`.
+3.11-3.13, and runs the PostgreSQL-marked tests plus the chaos harness against a
+PostgreSQL service the GitHub runner provides.
 
 ## Design
 
@@ -249,7 +244,6 @@ durableflow/worker.py        bounded claims, heartbeats, task execution
 durableflow/chaos.py         deterministic crash/retry/recovery trace
 durableflow/benchmark.py     reproducible concurrent claim benchmark
 alembic/                     migrations (initial revision generated from orm.py)
-Dockerfile, compose.yaml     container image and the api/worker/postgres/prometheus stack
 tests/                       store, failure, concurrency, worker, API, and Postgres tests
 ```
 
@@ -267,8 +261,8 @@ tests/                       store, failure, concurrency, worker, API, and Postg
   stateless coordinator restart, stale-worker rejection via monotonic fencing
   tokens, idempotent submissions/effects, and bounded concurrent execution.
 - Instrumented with structlog, Prometheus (queue depth, retries, DLQ, lease
-  expiry), and OpenTelemetry traces; containerized with a non-root image and a
-  Compose stack.
+  expiry), and OpenTelemetry traces, with `/healthz` and `/readyz` probes that
+  fail closed when the database is unreachable.
 - Created deterministic chaos and reproducible load harnesses; verified 2,000
   durable jobs with zero lost or duplicate claims across repeated runs, and used
   the harness to diagnose and fix a read-path lock-promotion bug that was

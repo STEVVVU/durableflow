@@ -178,10 +178,9 @@ def _register_routes(app: FastAPI) -> None:
     async def readyz(store: StoreDep, response: Response) -> ReadinessResponse:
         """Readiness: the database is reachable, so work can actually be accepted.
 
-        This is the probe target for whatever supervises the process -- the
-        Dockerfile HEALTHCHECK, or any external supervisor. It fails closed with
-        503 rather than reporting healthy, so a supervisor can pull a replica
-        that has lost its database out of rotation.
+        This is the probe target for whatever supervises the process. It fails
+        closed with 503 rather than reporting healthy, so a supervisor can pull a
+        replica that has lost its database out of rotation.
 
         Distinct from ``/healthz``: the process can be perfectly alive while its
         database is unreachable, and only one of those means it can do work.
