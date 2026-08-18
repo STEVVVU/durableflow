@@ -112,8 +112,9 @@ writer, so it is the local/test backend rather than the production one.
 
 PostgreSQL raises that ceiling. `SKIP LOCKED` allows many workers to claim
 concurrently without blocking each other, and the API and worker processes are
-stateless, so both scale horizontally: extra worker processes against the same
-database need no coordination, because every claim is lease-fenced.
+stateless, so both scale horizontally (`docker compose up --scale worker=3`):
+extra worker processes against the same database need no coordination, because
+every claim is lease-fenced.
 The remaining boundary is that this is still one database, not a replicated
 multi-region control plane; see [the Temporal comparison](vs-temporal.md) for
 where that boundary sits relative to a full durable-execution engine.

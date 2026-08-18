@@ -111,6 +111,28 @@ Running more than one worker needs no coordination: workers are stateless and
 every claim is lease-fenced, so starting additional `durableflow worker`
 processes against the same database is safe.
 
+### Run the whole stack with Docker Compose
+
+`compose.yaml` brings up the API, coordinator, worker, PostgreSQL, and Prometheus.
+Migrations run to completion before any process starts, so nothing races an
+incomplete schema:
+
+```powershell
+docker compose up --build
+docker compose up --build --scale worker=3   # workers are safe to scale: each claim is lease-fenced
+```
+
+The API is then on `http://127.0.0.1:8080` (OpenAPI docs at `/docs`) and
+Prometheus on `http://127.0.0.1:9090`. The image is built from
+`python:3.12-slim`, runs as a non-root user, and its `HEALTHCHECK` polls
+`/readyz`, which fails closed when the database is unreachable.
+
+> The image build is **verified in CI**, not on the author's machine — the Docker
+> daemon was unavailable there. `docker compose config` validates the stack and
+> the wheel the image installs builds and exposes the `durableflow` entry point,
+> but the image build itself is exercised by CI's `docker` job, which builds it
+> and probes `/readyz`. The green CI check is the evidence.
+
 The HTTP surface includes:
 
 | Method | Path | Purpose |
@@ -219,8 +241,9 @@ the JSON output records every parameter, the backend, and the claim strategy.
 The final local verification passed 41 tests in 21.98 seconds, including a live
 uvicorn socket test; the 5 PostgreSQL tests skipped, since no database was
 configured. CI runs lint, the SQLite suite, and the chaos harness on Python
-3.11-3.13, and runs the PostgreSQL-marked tests plus the chaos harness against a
-PostgreSQL service the GitHub runner provides.
+3.11-3.13; runs the PostgreSQL-marked tests plus the chaos harness against a
+PostgreSQL service the GitHub runner provides; and builds the Docker image and
+probes `/readyz`.
 
 ## Design
 
@@ -244,6 +267,7 @@ durableflow/worker.py        bounded claims, heartbeats, task execution
 durableflow/chaos.py         deterministic crash/retry/recovery trace
 durableflow/benchmark.py     reproducible concurrent claim benchmark
 alembic/                     migrations (initial revision generated from orm.py)
+Dockerfile, compose.yaml     container image and the api/worker/postgres/prometheus stack
 tests/                       store, failure, concurrency, worker, API, and Postgres tests
 ```
 
