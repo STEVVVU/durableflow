@@ -1,0 +1,13 @@
+# Line endings are repo state, not a per-developer git setting.
+#
+# Without this file, whether a checkout gets LF or CRLF depends on each
+# clone's core.autocrlf, so a file written on Windows and a file written on
+# Linux can differ by bytes alone. That divergence is invisible in a normal
+# diff and breaks anything that compares committed bytes.
+#
+# Everything tracked here is text (Python, Markdown, TOML, YAML, INI, the
+# Dockerfile, the Alembic templates); there are no binary files in this repo,
+# so there is nothing to exempt. If a binary artifact is ever added, give it an
+# explicit `binary` line below -- otherwise the `text` attribute will strip
+# CR bytes out of it on commit and silently corrupt it.
+* text eol=lf
