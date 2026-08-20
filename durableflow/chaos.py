@@ -49,7 +49,10 @@ def run_chaos_scenario(*, database_url: str | None = None) -> dict[str, Any]:
             idempotency_key="order-42",
             max_attempts=3,
         )
-        assert duplicate.created is False and duplicate.job.id == crash_job.id
+        submission_deduplicated = (
+            duplicate.created is False and duplicate.job.id == crash_job.id
+        )
+        assert submission_deduplicated
 
         first_lease = store.claim(
             "worker-crashes", limit=1, lease_seconds=5
@@ -57,10 +60,13 @@ def run_chaos_scenario(*, database_url: str | None = None) -> dict[str, Any]:
         effect, effect_created = store.record_effect(
             first_lease.id, "charge", 42
         )
-        assert effect == 42 and effect_created
+        first_effect_recorded = effect == 42 and effect_created
+        assert first_effect_recorded
 
         clock.advance(5)
-        assert coordinator.tick() == 1
+        recovered = coordinator.tick()
+        lease_recovered = recovered == 1
+        assert lease_recovered
         clock.advance(store.backoff_for(1))
         second_lease = store.claim(
             "worker-recovers", limit=1, lease_seconds=5
@@ -68,26 +74,29 @@ def run_chaos_scenario(*, database_url: str | None = None) -> dict[str, Any]:
         effect, effect_created_again = store.record_effect(
             second_lease.id, "charge", 42
         )
-        assert effect == 42 and not effect_created_again
-        assert not store.complete(
+        effect_replay_deduplicated = effect == 42 and not effect_created_again
+        assert effect_replay_deduplicated
+        stale_completion_rejected = not store.complete(
             first_lease.id,
             "worker-crashes",
             first_lease.lease_token or "",
             {"stale": True},
         )
-        assert store.complete(
+        assert stale_completion_rejected
+        fresh_owner_completed = store.complete(
             second_lease.id,
             "worker-recovers",
             second_lease.lease_token or "",
             {"effect_created": effect_created_again},
         )
+        assert fresh_owner_completed
 
         poison = store.submit(
             {"task": "flaky", "failures_before_success": 99},
             max_attempts=2,
         ).job
         poison_first = store.claim("worker-a", limit=1, lease_seconds=5)[0]
-        assert (
+        first_failure_requeued = (
             store.fail(
                 poison.id,
                 "worker-a",
@@ -96,9 +105,10 @@ def run_chaos_scenario(*, database_url: str | None = None) -> dict[str, Any]:
             )
             == JobStatus.QUEUED
         )
+        assert first_failure_requeued
         clock.advance(store.backoff_for(1))
         poison_second = store.claim("worker-b", limit=1, lease_seconds=5)[0]
-        assert (
+        final_failure_dead_lettered = (
             store.fail(
                 poison.id,
                 "worker-b",
@@ -107,27 +117,48 @@ def run_chaos_scenario(*, database_url: str | None = None) -> dict[str, Any]:
             )
             == JobStatus.DEAD_LETTER
         )
+        assert final_failure_dead_lettered
 
         cancelled = store.submit({"task": "echo", "value": "unused"}).job
-        assert store.cancel(cancelled.id)
+        cancel_accepted = store.cancel(cancelled.id)
+        assert cancel_accepted
 
         final_crash = store.get(crash_job.id)
         final_poison = store.get(poison.id)
         final_cancelled = store.get(cancelled.id)
-        assert final_crash and final_crash.status == JobStatus.SUCCEEDED
-        assert final_crash.attempts == 2
-        assert final_poison and final_poison.status == JobStatus.DEAD_LETTER
-        assert final_cancelled and final_cancelled.status == JobStatus.CANCELLED
+        crash_job_succeeded = bool(final_crash) and final_crash.status == JobStatus.SUCCEEDED
+        assert crash_job_succeeded
+        crash_job_retried_once = final_crash.attempts == 2
+        assert crash_job_retried_once
+        poison_job_dead_lettered = (
+            bool(final_poison) and final_poison.status == JobStatus.DEAD_LETTER
+        )
+        assert poison_job_dead_lettered
+        cancelled_job_is_cancelled = (
+            bool(final_cancelled) and final_cancelled.status == JobStatus.CANCELLED
+        )
+        assert cancelled_job_is_cancelled
 
         result = {
             "scenario": "crash_retry_recovery",
+            # Each value is the observed outcome of the condition the
+            # correspondingly-named bare assert above checks, not a constant.
+            # A caller asserting on these therefore fails if the behaviour
+            # regresses; the bare asserts remain to fail fast and localize.
             "assertions": {
-                "idempotent_submission": True,
-                "expired_lease_recovered": True,
-                "stale_completion_fenced": True,
-                "side_effect_deduplicated": True,
-                "poison_job_dead_lettered": True,
-                "queued_job_cancelled": True,
+                "idempotent_submission": submission_deduplicated,
+                "expired_lease_recovered": lease_recovered and crash_job_retried_once,
+                "stale_completion_fenced": (
+                    stale_completion_rejected and fresh_owner_completed and crash_job_succeeded
+                ),
+                "side_effect_deduplicated": (
+                    first_effect_recorded and effect_replay_deduplicated
+                ),
+                "poison_job_dead_lettered": (
+                    first_failure_requeued and final_failure_dead_lettered
+                    and poison_job_dead_lettered
+                ),
+                "queued_job_cancelled": cancel_accepted and cancelled_job_is_cancelled,
             },
             "jobs": {
                 "crash_recovery": {
