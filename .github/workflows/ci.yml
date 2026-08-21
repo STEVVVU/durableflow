@@ -34,7 +34,12 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest -v
+      - run: python -m pytest -v --junitxml=junit-sqlite.xml
+      # A green pytest proves nothing failed, not that anything ran: dropping a
+      # test file still exits 0. 41 of the 46 tests pass without a database;
+      # the 5 PostgreSQL-marked ones self-skip and are covered by test-postgres.
+      - name: Passing-test count floor
+        run: python scripts/check_test_counts.py junit-sqlite.xml --min-passed 41
       - name: Deterministic failure assertions (chaos)
         run: python -m durableflow.chaos
 
@@ -70,7 +75,16 @@ jobs:
       - name: Apply migrations
         run: python -m alembic upgrade head
       - name: Full suite including Postgres-marked tests
-        run: python -m pytest -v
+        run: python -m pytest -v --junitxml=junit-postgres.xml
+      # The PostgreSQL tests skip themselves when the URL is unset, so this job
+      # could otherwise go green while verifying nothing about PostgreSQL. The
+      # scoped floor counts passes only, so a skip fails the build like a
+      # deletion: all 46 tests must pass here, 5 of them in test_postgres.
+      - name: Passing-test count floor (Postgres tests must run, not skip)
+        run: >-
+          python scripts/check_test_counts.py junit-postgres.xml
+          --min-passed 46
+          --min-passed-in tests.test_postgres=5
       - name: Chaos assertions against Postgres
         run: python -m durableflow.chaos --database "$DURABLEFLOW_TEST_POSTGRES_URL"
 

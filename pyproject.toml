@@ -45,7 +45,9 @@ include = ["durableflow*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# --strict-markers turns a typo'd marker into an error rather than a silent
+# no-op that would deselect nothing and quietly run the wrong set of tests.
+addopts = "-ra --strict-markers"
 markers = [
     "postgres: requires a live PostgreSQL instance (set DURABLEFLOW_TEST_POSTGRES_URL)",
 ]

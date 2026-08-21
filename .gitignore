@@ -12,3 +12,5 @@ dist/
 build/
 *.egg-info/
 .ruff_cache/
+# JUnit reports the CI test-count floor reads; regenerated on every run.
+junit-*.xml

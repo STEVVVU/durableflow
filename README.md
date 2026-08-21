@@ -245,6 +245,13 @@ configured. CI runs lint, the SQLite suite, and the chaos harness on Python
 PostgreSQL service the GitHub runner provides; and builds the Docker image and
 probes `/readyz`.
 
+Because a green pytest run proves only that nothing failed and not that
+anything ran, both test jobs assert a floor on the number of tests that
+*passed* (`scripts/check_test_counts.py`). The PostgreSQL job scopes that floor
+to `tests.test_postgres`, so if those five tests ever skip -- which they do
+whenever `DURABLEFLOW_TEST_POSTGRES_URL` is missing -- the job fails instead of
+reporting a green check that verified nothing about PostgreSQL.
+
 ## Design
 
 The [architecture](docs/architecture.md) describes component ownership,
