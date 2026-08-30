@@ -1,9 +1,8 @@
-# DurableFlow
+# Distributed Job Queue
 
-DurableFlow is a locally runnable job orchestration service with real
-API/coordinator/worker boundaries. It persists jobs and transition history in
-SQLite WAL, assigns fenced worker leases, recovers abandoned work, retries with
-exponential backoff, and isolates exhausted jobs for operator redrive.
+A locally runnable distributed job queue that persists work, coordinates
+multiple workers, retries failures, and recovers jobs after worker or process
+restarts.
 
 It uses only Python 3.11+ standard-library modules. No Docker or hosted service
 is required.
